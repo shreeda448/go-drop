@@ -1,6 +1,7 @@
 package main
 
 import (
+	"embed"
 	"fmt"
 	"io"
 	"log"
@@ -19,9 +20,16 @@ type Form struct {
 }
 
 const (
-	maxUploadSize   = 10 * 1024 * 1024
-	uploadDirectory = "/home/shreeda/Downloads"
+	maxUploadSize = 10 * 1024 * 1024
 )
+
+var (
+	uploadDirectory string
+	curSessionToken string
+)
+
+//go:embed index.html
+var htmlForm embed.FS
 
 func getLocalIPAddr() ([]string, error) {
 	var ips []string
@@ -56,6 +64,7 @@ func getLocalIPAddr() ([]string, error) {
 func generateQR(localIPAddr string, port string) string {
 	// generate a session token
 	sessionToken := uuid.New().String()
+	curSessionToken = sessionToken
 	// url where the file transfer will happen
 	uploadURL := fmt.Sprintf("http://%s:%s/upload?token=%s", localIPAddr, port, sessionToken)
 	fmt.Print("Scan this QR code with your phone to upload a file:\n\n")
@@ -84,7 +93,11 @@ func formHandler(w http.ResponseWriter, r *http.Request) {
 	f := Form{
 		Token: token,
 	}
-	templ, err := template.ParseFiles("index.html")
+	if token != curSessionToken {
+		http.Error(w, "unauthorised for file transfer", http.StatusBadRequest)
+		return
+	}
+	templ, err := template.ParseFS(htmlForm, "index.html")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		log.Fatal(err)
@@ -93,9 +106,33 @@ func formHandler(w http.ResponseWriter, r *http.Request) {
 	templ.Execute(w, f)
 }
 
+func generateUniqueFilepath(uploadDir, filename string) string {
+	basePath := filepath.Join(uploadDir, filename)
+	if _, err := os.Stat(basePath); os.IsNotExist(err) {
+		return basePath
+	}
+	ext := filepath.Ext(filename)
+	nameWithoutExt := filename[:len(filename)-len(ext)]
+
+	counter := 1
+	for {
+		newFilename := fmt.Sprintf("%s(%d)%s", nameWithoutExt, counter, ext)
+		newPath := filepath.Join(uploadDir, newFilename)
+		if _, err := os.Stat(newPath); os.IsNotExist(err) {
+			return newPath
+		}
+		counter++
+	}
+}
+
 func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	token := r.URL.Query().Get("token")
+	if token != curSessionToken || curSessionToken == "" {
+		http.Error(w, "unauthorised for file transfer", http.StatusUnauthorized)
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
@@ -118,8 +155,8 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
-	dstPath := filepath.Join(uploadDirectory, handler.Filename)
-	dst, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	dstPath := generateUniqueFilepath(uploadDirectory, handler.Filename)
+	dst, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
 	if err != nil {
 		http.Error(w, "Unable to save the file", http.StatusInternalServerError)
 		return
@@ -132,10 +169,19 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Successfully uploaded file: %s", handler.Filename)
+	savedName := filepath.Base(dstPath)
+	fmt.Fprintf(w, "Successfully uploaded file as: %s", savedName)
+	curSessionToken = ""
 }
 
 func main() {
+	// get the upload directory of the current user
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		log.Fatal("not able to find the home directory")
+		return
+	}
+	uploadDirectory = fmt.Sprintf("%s/Downloads", homeDir)
 	// get the local ip address
 	localIP, err := getLocalIPAddr()
 	if err != nil || len(localIP) == 0 {
