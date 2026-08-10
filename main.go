@@ -2,13 +2,25 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
+	"text/template"
 
 	"github.com/google/uuid"
 	"github.com/mdp/qrterminal/v3"
+)
+
+type Form struct {
+	Token string
+}
+
+const (
+	maxUploadSize   = 10 * 1024 * 1024
+	uploadDirectory = "/home/shreeda/Downloads"
 )
 
 func getLocalIPAddr() ([]string, error) {
@@ -60,27 +72,67 @@ func generateQR(localIPAddr string, port string) string {
 	return uploadURL
 }
 
-func uploadHandler(w http.ResponseWriter, r *http.Request) {
+func formHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	// Grab the token from query params to verify it later if needed
 	token := r.URL.Query().Get("token")
 	w.Header().Set("Content-Type", "text/html;charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	// 2. Send a massive, centered HTML heading so it is impossible to miss
-	hugeText := fmt.Sprintf(`
-		<html>
-		<head>
-			<meta name="viewport" content="width=device-width, initial-scale=1.0">
-		</head>
-		<body style="background-color: #1e1e2e; color: #ffffff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; font-family: sans-serif;">
-			<h1 style="text-align: center; font-size: 50px;">
-				Hello Go-Drop!<br>
-				<span style="font-size: 25px; color: #a6adc8;">Token: %s</span>
-			</h1>
-		</body>
-		</html>
-	`, token)
+	f := Form{
+		Token: token,
+	}
+	templ, err := template.ParseFiles("index.html")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		log.Fatal(err)
+		return
+	}
+	templ.Execute(w, f)
+}
 
-	fmt.Fprint(w, hugeText)
+func uploadHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	err := r.ParseMultipartForm(maxUploadSize)
+	if err != nil {
+		http.Error(w, "invalid multipart form or file size too big", http.StatusBadRequest)
+		return
+	}
+	file, handler, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "Error retrieving the file", http.StatusBadRequest)
+		log.Printf("error retrieving the file:%v", err)
+		return
+	}
+	defer file.Close()
+	fmt.Printf("Uploaded File: %s\n", handler.Filename)
+	fmt.Printf("File Size: %d bytes\n", handler.Size)
+	err = os.MkdirAll(uploadDirectory, os.ModePerm)
+	if err != nil {
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		return
+	}
+	dstPath := filepath.Join(uploadDirectory, handler.Filename)
+	dst, err := os.OpenFile(dstPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
+	if err != nil {
+		http.Error(w, "Unable to save the file", http.StatusInternalServerError)
+		return
+	}
+	defer dst.Close()
+	_, err = io.Copy(dst, file)
+	if err != nil {
+		http.Error(w, "Error saving the file contents", http.StatusInternalServerError)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+	fmt.Fprintf(w, "Successfully uploaded file: %s", handler.Filename)
 }
 
 func main() {
@@ -102,7 +154,8 @@ func main() {
 	fmt.Printf("\nServer will listen on: %s\n", uploadURL)
 	mux := http.NewServeMux()
 	addr := fmt.Sprintf(":%s", port)
-	mux.HandleFunc("/upload", uploadHandler)
+	mux.HandleFunc("GET /upload", formHandler)
+	mux.HandleFunc("POST /upload", uploadHandler)
 	err = http.ListenAndServe(addr, mux)
 	if err != nil {
 		log.Printf("failed to find the local ip : %v", err)
