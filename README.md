@@ -7,6 +7,8 @@ A fast, terminal-based local file transfer tool written in Go.
 Built with the beautiful [Bubble Tea](https://github.com/charmbracelet/bubbletea) framework.
 
 ---
+<img width="1920" height="1080" alt="screen1" src="https://github.com/user-attachments/assets/abe5cd4b-b9f9-48b2-b029-c918108c3ed7" />
+<img width="1920" height="1080" alt="screen2" src="https://github.com/user-attachments/assets/8226a23d-bd37-4ec9-9691-e4f93f461e66" />
 
 ## ✨ Features
 
