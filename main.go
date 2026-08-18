@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"embed"
 	"fmt"
 	"io"
@@ -11,6 +12,8 @@ import (
 	"path/filepath"
 	"text/template"
 
+	"charm.land/bubbles/v2/spinner"
+	tea "charm.land/bubbletea/v2"
 	"github.com/google/uuid"
 	"github.com/mdp/qrterminal/v3"
 )
@@ -19,20 +22,155 @@ type Form struct {
 	Token string
 }
 
+type uploadSuccessMsg struct {
+	filename string
+}
+
+type uploadErrorMsg struct {
+	err error
+}
+
+type NetworkInterface struct {
+	Name string
+	IP   string
+}
+
+type networkSelection struct {
+	ifaces []NetworkInterface
+	cursor int
+}
+
+type waitingScreen struct {
+	qrCodeStr string
+	uploadURL string
+	choseIP   string
+	spinner   spinner.Model
+}
+
+type endScreen struct {
+	successMsg string
+	err        error
+}
+
+type model struct {
+	state int
+	n     networkSelection
+	w     waitingScreen
+	e     endScreen
+}
+
 const (
 	maxUploadSize = 10 * 1024 * 1024
+	stateSelectIP = iota
+	stateWait
+	stateDone
 )
 
 var (
 	uploadDirectory string
 	curSessionToken string
+	p               *tea.Program
 )
 
 //go:embed index.html
 var htmlForm embed.FS
 
-func getLocalIPAddr() ([]string, error) {
-	var ips []string
+func (m model) View() tea.View {
+	switch m.state {
+	case stateSelectIP:
+		s := "Select a Network:\n"
+		for i, ip := range m.n.ifaces {
+			cursor := " "
+			if m.n.cursor == i {
+				cursor = ">"
+			}
+			s += fmt.Sprintf("%s %s\n", cursor, ip)
+		}
+		s += "\n(use up/down or j/k to move, enter to select, q to quit)\n"
+		return tea.NewView(s)
+	case stateWait:
+		return tea.NewView(fmt.Sprintf(
+			"Scan to upload:\n\n%s\n\nURL: %s\nCaution: Only files under 10MB\n%s",
+			m.w.qrCodeStr,
+			m.w.uploadURL,
+			m.w.spinner.View(),
+		))
+	case stateDone:
+		if m.e.err != nil {
+			return tea.NewView(fmt.Sprintf("Error: %s", m.e.err.Error()))
+		}
+		return tea.NewView(fmt.Sprintf("Success! Saved to: %s", m.e.successMsg))
+	default:
+		return tea.NewView("unknown state")
+	}
+}
+
+func initialModel() model {
+	localIps, err := getLocalIPAddr()
+	if err != nil {
+		log.Fatal(err)
+	}
+	s := spinner.New()
+	s.Spinner = spinner.Dot
+	myModel := model{
+		state: stateSelectIP,
+		n: networkSelection{
+			ifaces: localIps,
+			cursor: 0,
+		},
+		w: waitingScreen{
+			spinner: s,
+		},
+	}
+	return myModel
+}
+
+func (m model) Init() tea.Cmd {
+	return nil
+}
+
+func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case uploadSuccessMsg:
+		m.state = stateDone
+		m.e.successMsg = msg.filename
+		return m, tea.Quit
+	case uploadErrorMsg:
+		m.state = stateDone
+		m.e.err = msg.err
+		return m, tea.Quit
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.w.spinner, cmd = m.w.spinner.Update(msg)
+		return m, cmd
+	case tea.KeyPressMsg:
+		switch msg.String() {
+		case "ctrl+c", "q":
+			return m, tea.Quit
+		case "up", "k":
+			if m.n.cursor > 0 {
+				m.n.cursor--
+			}
+		case "down", "j":
+			if m.n.cursor < len(m.n.ifaces)-1 {
+				m.n.cursor++
+			}
+		case "enter":
+			if m.state == stateSelectIP {
+				m.w.choseIP = m.n.ifaces[m.n.cursor].IP
+				m.state = stateWait
+				qrStr, url := generateQR(m.w.choseIP, "8080")
+				m.w.qrCodeStr = qrStr
+				m.w.uploadURL = url
+				return m, m.w.spinner.Tick
+			}
+		}
+	}
+	return m, nil
+}
+
+func getLocalIPAddr() ([]NetworkInterface, error) {
+	var interfaces []NetworkInterface
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		return nil, err
@@ -51,34 +189,34 @@ func getLocalIPAddr() ([]string, error) {
 			case *net.IPAddr:
 				ip = v.IP
 			}
-			// Skip loopback and IPv6 addresses
 			if ip == nil || ip.IsLoopback() || ip.To4() == nil {
 				continue
 			}
-			ips = append(ips, ip.String())
+			// Save both the interface name and the IP
+			interfaces = append(interfaces, NetworkInterface{Name: i.Name, IP: ip.String()})
 		}
 	}
-	return ips, nil
+	return interfaces, nil
 }
 
-func generateQR(localIPAddr string, port string) string {
+func generateQR(localIPAddr string, port string) (string, string) {
 	// generate a session token
 	sessionToken := uuid.New().String()
 	curSessionToken = sessionToken
 	// url where the file transfer will happen
 	uploadURL := fmt.Sprintf("http://%s:%s/upload?token=%s", localIPAddr, port, sessionToken)
-	fmt.Print("Scan this QR code with your phone to upload a file:\n\n")
+	var buf bytes.Buffer
 	// config for the qr
 	cfg := qrterminal.Config{
 		Level:     qrterminal.L,     // level of error tolerance
-		Writer:    os.Stdout,        // destination where the qr should be displayed
+		Writer:    &buf,             // destination where the qr should be displayed
 		BlackChar: qrterminal.BLACK, // color of the dark part of qr
 		WhiteChar: qrterminal.WHITE, // color of the white part of qr
-		QuietZone: 1,                // empty space around the qr
+		QuietZone: 2,                // empty space around the qr
 	}
 	// generate the qr
 	qrterminal.GenerateWithConfig(uploadURL, cfg)
-	return uploadURL
+	return buf.String(), uploadURL
 }
 
 func formHandler(w http.ResponseWriter, r *http.Request) {
@@ -89,13 +227,13 @@ func formHandler(w http.ResponseWriter, r *http.Request) {
 	// Grab the token from query params to verify it later if needed
 	token := r.URL.Query().Get("token")
 	w.Header().Set("Content-Type", "text/html;charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	f := Form{
-		Token: token,
-	}
 	if token != curSessionToken {
 		http.Error(w, "unauthorised for file transfer", http.StatusBadRequest)
 		return
+	}
+	w.WriteHeader(http.StatusOK)
+	f := Form{
+		Token: token,
 	}
 	templ, err := template.ParseFS(htmlForm, "index.html")
 	if err != nil {
@@ -165,6 +303,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	_, err = io.Copy(dst, file)
 	if err != nil {
 		http.Error(w, "Error saving the file contents", http.StatusInternalServerError)
+		p.Send(uploadErrorMsg{err: err})
 		return
 	}
 
@@ -172,6 +311,7 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 	savedName := filepath.Base(dstPath)
 	fmt.Fprintf(w, "Successfully uploaded file as: %s", savedName)
 	curSessionToken = ""
+	p.Send(uploadSuccessMsg{filename: savedName})
 }
 
 func main() {
@@ -182,29 +322,17 @@ func main() {
 		return
 	}
 	uploadDirectory = fmt.Sprintf("%s/Downloads", homeDir)
-	// get the local ip address
-	localIP, err := getLocalIPAddr()
-	if err != nil || len(localIP) == 0 {
-		log.Printf("failed to find the local ip : %v", err)
-		return
-	}
-	fmt.Println("Found these IPs on your machine:")
-	for i, ip := range localIP {
-		fmt.Printf("[%d] %s\n", i, ip)
-	}
-	targetIP := localIP[0]
-	fmt.Printf("\n--> Generating QR for IP: %s\n", targetIP)
-	// assign a port for the server to run
-	port := "8080"
-	uploadURL := generateQR(targetIP, port)
-	fmt.Printf("\nServer will listen on: %s\n", uploadURL)
 	mux := http.NewServeMux()
-	addr := fmt.Sprintf(":%s", port)
 	mux.HandleFunc("GET /upload", formHandler)
 	mux.HandleFunc("POST /upload", uploadHandler)
-	err = http.ListenAndServe(addr, mux)
-	if err != nil {
-		log.Printf("failed to find the local ip : %v", err)
-		return
+	go func() {
+		err = http.ListenAndServe(":8080", mux)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}()
+	p = tea.NewProgram(initialModel())
+	if _, err := p.Run(); err != nil {
+		log.Fatalf("Alas, there's been an error: %v", err)
 	}
 }
