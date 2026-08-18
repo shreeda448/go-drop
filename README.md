@@ -70,4 +70,4 @@ go build -o go-drop main.go
   * Linux (UFW): Run `sudo ufw allow 8080/tcp`
 
 **The QR code looks distorted!**
-Ensure you are using a modern terminal emulator that supports standard ANSI escape sequences and non-breaking spaces.
+* Ensure you are using a modern terminal emulator that supports standard ANSI escape sequences and non-breaking spaces.
